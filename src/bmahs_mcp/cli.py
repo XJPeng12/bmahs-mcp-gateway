@@ -132,11 +132,13 @@ async def cmd_ctl(args: argparse.Namespace) -> int:
     released = False
     try:
         if action == "release":
-            # release 需要 token：CLI 不持久化，这里先尝试按参数占用再立即释放没有意义；
-            # 直接按协议要求提示
-            print("release 需要占用 token；请使用 --arg token=<occupy 返回值> 传入")
-            await disc.stop()
-            return 1
+            # release 需要原占用 token：CLI 不持久化，须显式通过 --arg token=... 提供
+            if not extra.get("token"):
+                print("release 需要原占用 token；请使用 --arg token=<occupy 返回值> 传入")
+                return 2
+            resp = await call({"action": action, "agent": agent, **extra})
+            print(json.dumps(resp, ensure_ascii=False, indent=2))
+            return 0 if resp.get("ok") else 1
         if action == "occupy":
             payload = {"action": "occupy", "agent": agent}
             if args.ttl is not None:

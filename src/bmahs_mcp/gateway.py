@@ -255,7 +255,9 @@ class Gateway:
                 for dev in self.discovery.all():
                     if dev.hello is not None:
                         continue
-                    if now_mono - dev.hello_fail_at < HELLO_RETRY_SEC:
+                    # hello_fail_at=0 表示从未失败；系统刚开机时 time.monotonic()
+                    # 可能还很小，不排除 0 会把全部设备误判为退避中
+                    if dev.hello_fail_at > 0 and now_mono - dev.hello_fail_at < HELLO_RETRY_SEC:
                         continue
                     try:
                         async with self._hello_sema:
