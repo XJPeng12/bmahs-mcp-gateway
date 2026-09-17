@@ -1,0 +1,63 @@
+[project]
+name = "bmahs-mcp-gateway"
+description = "BMAHS（比马斯）设备协议 ↔ MCP 网关：发现并操作局域网内的 BMAHS 硬件设备"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "彭星杰" }]
+keywords = ["bmahs", "mcp", "iot", "smart-home", "zeroconf", "llm", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Home Automation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# 版本单源于 src/bmahs_mcp/__init__.py 的 __version__
+dynamic = ["version"]
+dependencies = [
+    "mcp>=2.2.0",
+    "zeroconf>=0.151.3",
+]
+
+[project.optional-dependencies]
+# Streamable HTTP 共享模式（bmahs-mcp http）才需要 uvicorn；默认 stdio 模式无需安装
+http = ["uvicorn>=0.30"]
+
+[project.scripts]
+bmahs-mcp = "bmahs_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/XJPeng12/bmahs-mcp-gateway"
+Repository = "https://github.com/XJPeng12/bmahs-mcp-gateway"
+Issues = "https://github.com/XJPeng12/bmahs-mcp-gateway/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/bmahs_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bmahs_mcp"]
+
+# sdist 只收核心包相关文件：docs 在仓库里维护，不进源码包
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "tests",
+    "README.md",
+    "LICENSE",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
