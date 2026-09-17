@@ -76,6 +76,8 @@ uv publish     # 发布到 PyPI（需配置 token）
 uv run pytest  # 运行测试
 ```
 
+发布到 PyPI 的完整流程与注意事项见 [RELEASING.md](RELEASING.md)。
+
 ## License
 
 [MIT](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/LICENSE)
