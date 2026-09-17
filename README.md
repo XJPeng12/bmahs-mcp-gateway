@@ -21,6 +21,8 @@ pip install "bmahs-mcp-gateway[http]"    # 需要 Streamable HTTP 共享模式�
 
 ## 快速开始
 
+> 完整的下载、安装、MCP 客户端接入与排障说明见 [USAGE.md](USAGE.md)（两个版本通用）。
+
 ```bash
 # 扫描局域网内的 BMAHS 设备
 bmahs-mcp discover
