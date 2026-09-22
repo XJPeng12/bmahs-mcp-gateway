@@ -44,7 +44,7 @@ async def _close(writer: asyncio.StreamWriter) -> None:
         pass
 
 
-async def _read_line(reader: asyncio.StreamReader, timeout: float) -> dict:
+async def _read_obj(reader: asyncio.StreamReader, timeout: float) -> dict:
     """按行协议读一行并解析为 JSON 对象；超时 / 断连 / 非 JSON / 非对象均抛 BmahsError。"""
     try:
         line = await asyncio.wait_for(reader.readline(), timeout)
@@ -62,16 +62,20 @@ async def _read_line(reader: asyncio.StreamReader, timeout: float) -> dict:
 
 
 async def fetch_hello(uri: str, timeout: float = 8.0) -> dict:
-    """连上 control 并读取首行 hello（§6.2）。
+    """连上 control 并读取首行 hello。
 
-    校验 `operations`（兼容期同时接受旧版 bmahs/1.2 设备的 `ops` 键）。
+    双协议（1.2 §20 编码协商）：按首行**实际形态**识别——JSON-RPC 通知
+    （``method:"hello"`` 无 id）为 bmahs/1.2 设备，取其 params 归一为扁平 hello；
+    1.x 响应式对象（含 ``action:"hello"``）为旧版设备，原样使用。
+    校验 `operations`（兼容期同时接受旧版 bmahs/1–1.2 时期设备的 `ops` 键）。
     """
     reader, writer = await _connect(uri, timeout)
     try:
-        hello = await _read_line(reader, timeout)
+        raw = await _read_obj(reader, timeout)
     finally:
         await _close(writer)
-    if hello.get("action") != "hello" or not (
+    hello = P.normalize_hello(raw)
+    if hello is None or not (
         isinstance(hello.get("operations"), list) or isinstance(hello.get("ops"), list)
     ):
         raise BmahsError("连接后未收到合法的 hello（对端可能不是 BMAHS 设备）")
@@ -81,14 +85,31 @@ async def fetch_hello(uri: str, timeout: float = 8.0) -> dict:
 async def call_action(
     uri: str, payload: dict, timeout: float = DEFAULT_TIMEOUT
 ) -> tuple[dict, dict]:
-    """短连接一问一答：hello → 请求行 → 响应行。返回 (hello, response)。"""
+    """短连接一问一答：hello → 请求行 → 响应行。返回 (hello, response)。
+
+    双协议：hello 为 1.2 通知形态时按 JSON-RPC 2.0 发请求（``method``=动作、
+    ``params``=扁平参数去 action），并把 result/error 还原为 1.x 扁平信封——
+    上游（网关占用分流 / 错误透传 / token 遮蔽）完全不感知编码差异；
+    hello 为 1.x 形态时走原自定义 JSON 行协议。
+    """
     reader, writer = await _connect(uri, timeout)
     try:
-        hello = await _read_line(reader, min(timeout, 10.0))
-        line = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
-        writer.write(line)
-        await writer.drain()
-        resp = await _read_line(reader, timeout)
+        raw_hello = await _read_obj(reader, min(timeout, 10.0))
+        hello = P.normalize_hello(raw_hello)
+        if hello is None:
+            raise BmahsError("连接后未收到合法的 hello（对端可能不是 BMAHS 设备）")
+        action = str(payload.get("action") or "")
+        if P.is_hello_notification(raw_hello):
+            writer.write(P.rpc_call_line(1, action,
+                                         {k: v for k, v in payload.items() if k != "action"}))
+            await writer.drain()
+            resp_obj = await _read_obj(reader, timeout)
+            resp = P.rpc_response_to_envelope(action, resp_obj)
+        else:
+            line = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
+            writer.write(line)
+            await writer.drain()
+            resp = await _read_obj(reader, timeout)
     finally:
         await _close(writer)
     return hello, resp

@@ -1,20 +1,27 @@
-"""BMAHS 发现层常量与编解码（对应最新协议 bmahs/1.0 §3/§4/§5/§A）。
+"""BMAHS 发现层常量与编解码（发现层对应协议 §3/§4/§5；1.2 §7/§15）。
 
-字段名按最新标准：``version`` / ``protocol`` / ``timestamp`` / ``service`` /
-``capabilities`` / ``security``。解析侧同时接受旧版（bmahs/1.2 时期）的
+发现层字段名按现行标准：``version`` / ``protocol`` / ``timestamp`` / ``service`` /
+``capabilities`` / ``security``。解析侧同时接受旧版（bmahs/1–1.2 时期）的
 ``v`` / ``proto`` / ``ts`` / ``svc`` / ``caps`` / ``sec``，便于平滑迁移；
-发送侧一律使用新字段名（§7.4：不得用 ``v`` 之类的旧字段名）。
+发送侧一律使用新字段名。
+
+使用层（TCP 控制通道）的 JSON-RPC 2.0 编解码（1.2 §8/§9）也集中在本模块：
+设备侧 ``rpc_serve_conn`` / 网关侧 ``rpc_response_to_envelope`` 共用同一套
+信封转换与错误码映射，保证两端文法一致。
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import re
 import time
 
 PROTO = "bmahs/1.0"
-PROTO_11 = "bmahs/1.1"  # 1.1 草案：占用策略、去掉必选 register、状态 online/offline
-PROTO_PREFIX = "bmahs"  # 智能体必须接受 bmahs*（bmahs/1.0 与 bmahs/1.1 互通）
+PROTO_11 = "bmahs/1.1"  # 1.1：占用策略、去掉必选 register、状态 online/offline
+PROTO_12 = "bmahs/1.2"  # 1.2：控制通道改 JSON-RPC 2.0 信封，hello 变通知（§8）
+PROTO_PREFIX = "bmahs"  # 智能体必须接受 bmahs*（1.0/1.1/1.2 发现层互通）
 # UDP 组播报文的三种类型（§3）：announce=设备上线/状态变化广播，
 # query=智能体主动扫描（设备以 announce 应答），goodbye=设备下线告别。
 KINDS = ("announce", "query", "goodbye")
@@ -113,12 +120,12 @@ def build_query(agent_id: str, want: str = "*") -> bytes:
     """构造智能体的扫描报文（§3.1）：设备收到后按 want 过滤并以 announce 应答。
 
     ``want`` 为品类过滤串（如 ``light,display``），``*`` 表示不过滤。
-    protocol 写网关支持的最高版本（1.0/1.1 设备侧校验均为 ``bmahs`` 前缀，互通）。
+    protocol 写网关支持的最高版本（1.0/1.1/1.2 设备侧校验均为 ``bmahs`` 前缀，互通）。
     """
     return _dump(
         {
             "version": 1,
-            "protocol": PROTO_11,
+            "protocol": PROTO_12,
             "kind": "query",
             "timestamp": now(),
             "id": agent_id,
@@ -230,3 +237,186 @@ def busy_of(state: str | None, busy) -> bool:
     if isinstance(busy, bool):
         return busy
     return state == "managed"
+
+
+# ---------------------------------------------------------------------------
+# bmahs/1.2 JSON-RPC 2.0 控制通道（§8/§9），设备侧与网关侧共用
+# ---------------------------------------------------------------------------
+
+# BMAHS 字符串错误码 → JSON-RPC 整数错误码（1.2 §9.1 映射表）
+RPC_METHOD_NOT_FOUND = -32601
+RPC_INVALID_PARAMS = -32602
+RPC_PARSE_ERROR = -32700
+RPC_INVALID_REQUEST = -32600
+RPC_INTERNAL_ERROR = -32603
+RPC_CODE_BY_BMAHS = {
+    "unknown-action": RPC_METHOD_NOT_FOUND,
+    "bad-arg": RPC_INVALID_PARAMS,
+    "parse-error": RPC_PARSE_ERROR,
+    "invalid-request": RPC_INVALID_REQUEST,
+    "internal-error": RPC_INTERNAL_ERROR,
+    "occupied": -32001,
+    "offline": -32002,
+    "busy": -32003,
+    "unauthorized": -32004,
+    "denied": -32005,
+    "bad-state": -32006,
+}
+
+
+def _json_line(obj) -> bytes:  # noqa: ANN001
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+
+
+def hello_notification(hello: dict) -> bytes:
+    """1.2 hello 通知行（§8.5）：params 字段集与 1.x hello 一致（去掉 ok/action），
+    无 id、无需应答；protocol 固定写 bmahs/1.2。"""
+    params = {k: v for k, v in hello.items() if k not in ("ok", "action")}
+    params["protocol"] = PROTO_12
+    return _json_line({"jsonrpc": "2.0", "method": "hello", "params": params})
+
+
+def is_hello_notification(obj) -> bool:  # noqa: ANN001
+    """按报文**实际形态**识别 1.2 hello 通知（§20 编码协商：不得假设，以形态为准）。"""
+    return isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and obj.get("method") == "hello"
+
+
+def normalize_hello(obj: dict | None) -> dict | None:
+    """TCP 首行 → 统一 hello dict（网关内部一律消费扁平形态）。
+
+    1.2 通知：取 ``params`` 并回填 ``action="hello"``；1.x 响应式对象原样返回；
+    非 hello 返回 None。
+    """
+    if not isinstance(obj, dict):
+        return None
+    if is_hello_notification(obj):
+        params = obj.get("params")
+        if not isinstance(params, dict):
+            return None
+        hello = dict(params)
+        hello.setdefault("action", "hello")
+        return hello
+    if obj.get("action") == "hello":
+        return obj
+    return None
+
+
+def rpc_call_line(rid, method: str, params: dict) -> bytes:  # noqa: ANN001
+    """构造 1.2 请求行（§8.2）：params 必须为对象形式；id 不得为 null。"""
+    return _json_line({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+
+
+def parse_rpc_line(line: bytes) -> tuple:
+    """解析一行设备侧收到的请求（§8.1 校验规则）。
+
+    返回 ``("req", id, method, params)``；不合规时返回 ``("resp", 响应行字节)``——
+    非法 JSON → -32700、非法信封/位置参数 → -32600（无法解析出 id 时 id=null）。
+    """
+    try:
+        msg = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ("resp", _rpc_error_line(None, "parse-error",
+                                        "请求不是合法的 JSON（一行一个 JSON-RPC 消息，\\n 结尾）", False))
+    rid = None
+    if isinstance(msg, dict):
+        rid = msg.get("id")
+        if isinstance(rid, bool) or not isinstance(rid, (int, str)):
+            rid = None  # JSON-RPC 禁止 null/浮点 id；无法关联则回 id=null
+    if (not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0"
+            or not isinstance(msg.get("method"), str) or not msg.get("method")):
+        return ("resp", _rpc_error_line(rid, "invalid-request",
+                                        "非法 JSON-RPC 请求：缺少 jsonrpc:\"2.0\" 或合法 method", False))
+    params = msg.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return ("resp", _rpc_error_line(rid, "bad-arg",
+                                        "params 必须是对象形式（Named Params），不得使用位置参数", False))
+    return ("req", rid, msg["method"], params)
+
+
+def rpc_result_line(rid, envelope: dict) -> bytes:  # noqa: ANN001
+    """1.x 扁平信封（ok/action/…）→ JSON-RPC 响应行（§8.3/§8.4/§9.1）。
+
+    成功：去掉 ok/action 后整体作为 ``result``（内容 = returns 声明字段）；
+    失败：转 ``error`` 对象——整数 code 按第 9 章映射，``data`` 必含
+    ``bmahs_code`` 与 ``retryable``，信封其余字段（holder/until/state 等）并入 data。
+    """
+    if envelope.get("ok") is False:
+        bmahs_code = str(envelope.get("code") or "internal-error")
+        data = {"bmahs_code": bmahs_code, "retryable": bool(envelope.get("retryable"))}
+        for k, v in envelope.items():
+            if k not in ("ok", "action", "code", "error", "retryable"):
+                data[k] = v
+        return _rpc_error_line(rid, bmahs_code, str(envelope.get("error") or bmahs_code),
+                               bool(envelope.get("retryable")), data)
+    result = {k: v for k, v in envelope.items() if k not in ("ok", "action")}
+    return _json_line({"jsonrpc": "2.0", "id": rid, "result": result})
+
+
+def rpc_response_to_envelope(method: str, resp: dict) -> dict:  # noqa: ANN001
+    """JSON-RPC 响应 → 1.x 扁平信封（网关侧用；上游占用分流/遮蔽逻辑零改动）。"""
+    err = resp.get("error") if isinstance(resp, dict) else None
+    if isinstance(err, dict):
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        envelope = {
+            "ok": False,
+            "action": method,
+            "code": str(data.get("bmahs_code") or "internal-error"),
+            "error": str(err.get("message") or "设备返回错误"),
+            "retryable": bool(data.get("retryable")),
+        }
+        for k, v in data.items():
+            if k not in ("bmahs_code", "retryable"):
+                envelope[k] = v
+        return envelope
+    result = resp.get("result") if isinstance(resp, dict) else None
+    envelope = {"ok": True, "action": method}
+    if isinstance(result, dict):
+        envelope.update(result)
+    return envelope
+
+
+def _rpc_error_line(rid, bmahs_code: str, message: str, retryable: bool, data: dict | None = None) -> bytes:  # noqa: ANN001
+    err = {
+        "code": RPC_CODE_BY_BMAHS.get(bmahs_code, RPC_INTERNAL_ERROR),
+        "message": message,
+        "data": {"bmahs_code": bmahs_code, "retryable": bool(retryable), **(data or {})},
+    }
+    return _json_line({"jsonrpc": "2.0", "id": rid, "error": err})
+
+
+async def rpc_serve_conn(handle, reader, writer, hello_line: bytes) -> None:  # noqa: ANN001
+    """1.2 设备控制连接服务循环（§8/§16.1），各设备 `_handle_conn` 共用。
+
+    ``handle`` 为设备动作分发器：接受 ``{"action": method, **params}`` 扁平请求，
+    返回 1.x 扁平信封（同步或协程均可）——业务层完全不感知 JSON-RPC 信封。
+    连接建立即写 hello 通知；逐行解析请求（非法行回 -32700/-32600）；
+    未知方法由业务层回 unknown-action（→ -32601）。
+    """
+    try:
+        writer.write(hello_line)
+        await writer.drain()
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            parsed = parse_rpc_line(line)
+            if parsed[0] == "resp":
+                out = parsed[1]
+            else:
+                _, rid, method, params = parsed
+                try:
+                    res = handle({"action": method, **params})
+                    if inspect.isawaitable(res):
+                        res = await res
+                except Exception as e:  # noqa: BLE001
+                    res = {"ok": False, "action": method, "code": "internal-error",
+                           "error": f"设备内部错误：{e}", "retryable": True}
+                out = rpc_result_line(rid, res)
+            writer.write(out)
+            await writer.drain()
+    except (ConnectionError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        writer.close()
