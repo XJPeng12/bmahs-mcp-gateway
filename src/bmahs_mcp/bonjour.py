@@ -37,9 +37,16 @@ _CALL_TIMEOUT = 10.0
 
 
 def build_txt(props: dict[str, Any]) -> dict[str, str]:
-    """按 §6.4 把 announce 摘要转成 TXT 键值（全部字符串，capabilities 逗号分隔）。"""
+    """按 §6.4 把 announce 摘要转成 TXT 键值（全部字符串，capabilities 逗号分隔）。
+
+    1.1 起 ``security`` 为三字段 ``scope,auth,occupancy``；1.0 props 未带
+    occupancy 时输出两字段（对端解析按缺省 exclusive 理解，语义一致）。
+    """
     caps = props.get("capabilities") or []
     sec = props.get("security") or {}
+    sec_parts = [str(sec.get("scope", "")), str(sec.get("auth", ""))]
+    if sec.get("occupancy"):
+        sec_parts.append(str(sec["occupancy"]))
     txt: dict[str, str] = {
         "txtvers": TXTVERS,
         "protocol": str(props.get("protocol", "")),
@@ -48,7 +55,7 @@ def build_txt(props: dict[str, Any]) -> dict[str, str]:
         "id": str(props.get("id", "")),
         "name": str(props.get("name", "")),
         "capabilities": ",".join(str(c) for c in caps),
-        "security": f"{sec.get('scope', '')},{sec.get('auth', '')}",
+        "security": ",".join(p for p in sec_parts if p),
         "state": str(props.get("state", "registered")),
         "busy": "1" if props.get("busy") else "0",
     }
@@ -84,7 +91,14 @@ def txt_to_announce(txt: dict, host: str, port: int) -> dict:
         return "" if v is None else str(v)
 
     norm = {s(k): v for k, v in txt.items()}
-    sec = s(norm.get("security")).split(",", 1)
+    # 1.1 TXT security=scope,auth,occupancy（三字段）；1.0 只有两字段，
+    # occupancy 缺省按 exclusive 理解（1.1 §6.4 兼容条款）
+    sec_parts = s(norm.get("security")).split(",")
+    security: dict[str, str] = {}
+    if len(sec_parts) >= 2 and sec_parts[0]:
+        security = {"scope": sec_parts[0], "auth": sec_parts[1]}
+        if len(sec_parts) >= 3 and sec_parts[2]:
+            security["occupancy"] = sec_parts[2]
     hb = s(norm.get("hb"))
     return {
         # 来源标记：真 UDP announce 的 kind 是 "announce"；注册表靠它区分
@@ -99,7 +113,7 @@ def txt_to_announce(txt: dict, host: str, port: int) -> dict:
         "model": s(norm.get("model")),
         "control": f"tcp://{host}:{port}",
         "capabilities": [c for c in s(norm.get("capabilities")).split(",") if c],
-        "security": {"scope": sec[0], "auth": sec[1]} if len(sec) == 2 else {},
+        "security": security,
         "state": s(norm.get("state")) or "registered",
         "busy": s(norm.get("busy")) == "1",
         "hb": int(hb) if hb.isdigit() else None,

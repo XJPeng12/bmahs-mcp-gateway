@@ -42,9 +42,10 @@ def build_server(gw: Gateway, *, per_session: bool = False) -> Server:
         instructions=(
             "本服务器是 BMAHS（比马斯）设备网关：每台发现的 BMAHS 设备的 operations 已映射为"
             "「<设备id>__<动作>」形式的工具，工具说明含设备的自然语言自述与安全边界。"
-            "先用 bmahs_devices 查看设备并按 name/summary 选型；控制类动作网关会自动"
-            "occupy 并携带 token；任务结束（含失败/取消）必须 bmahs_release，"
-            "否则设备会一直对其它智能体显示被占用。"
+            "先用 bmahs_devices 查看设备并按 name/summary 选型。网关按设备占用策略"
+            "（occupancy）自动选择控制方式：exclusive 设备控制前自动 occupy 并携带 token，"
+            "任务结束（含失败/取消）必须 bmahs_release；last-wins 设备无需占用/释放，"
+            "直接调用业务动作即可（最后一条命令生效）。"
         ),
         on_list_tools=_make_list_tools(gw, _skey),
         on_call_tool=_make_call_tool(gw, _skey),

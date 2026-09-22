@@ -76,6 +76,8 @@ class TestTxtRoundTrip:
         assert parsed["id"] == "x1"
         assert parsed["control"] == "tcp://192.168.3.51:9527"
         assert parsed["capabilities"] == ["on", "off"]
+        # TXT 解析保持忠实还原（两字段不臆造字段）；occupancy 缺省 exclusive
+        # 由注册表 Device.occupancy / protocol.normalize_occupancy 统一兜底
         assert parsed["security"] == {"scope": "lan", "auth": "token"}
         assert parsed["state"] == "registered"
         assert parsed["hb"] == 5
@@ -89,6 +91,38 @@ class TestTxtRoundTrip:
         assert parsed["capabilities"] == []
         assert parsed["security"] == {}
         assert parsed["hb"] is None
+
+    def test_build_txt_11_three_field_security(self):
+        """1.1 §6.4：TXT security=scope,auth,occupancy 三字段。"""
+        announce = {
+            "id": "x1",
+            "name": "客厅灯",
+            "type": "light",
+            "service": "light/1",
+            "protocol": "bmahs/1.1",
+            "capabilities": ["on", "off"],
+            "security": {"scope": "lan", "auth": "none", "occupancy": "last-wins"},
+            "summary": "吸顶灯",
+            "state": "online",
+            "busy": False,
+            "hb": 5,
+        }
+        txt = build_txt(announce)
+        assert txt["security"] == "lan,none,last-wins"
+        parsed = txt_to_announce(txt, "192.168.3.51", 9527)
+        assert parsed["security"] == {"scope": "lan", "auth": "none", "occupancy": "last-wins"}
+        assert parsed["protocol"] == "bmahs/1.1"
+        assert parsed["state"] == "online"
+
+    def test_parse_txt_10_two_fields_stay_two(self):
+        """1.0 两字段 TXT 忠实还原为两字段 security；不在此层补缺省。"""
+        parsed = txt_to_announce(fake_txt(), "192.168.3.51", 9527)
+        assert parsed["security"] == {"scope": "lan", "auth": "token"}
+        # 畸形 security（单字段/为空）不产生半截 dict
+        parsed = txt_to_announce(fake_txt(security="lan"), "192.168.3.51", 9527)
+        assert parsed["security"] == {}
+        parsed = txt_to_announce(fake_txt(security=""), "192.168.3.51", 9527)
+        assert parsed["security"] == {}
 
 
 class TestBonjourRegistry:

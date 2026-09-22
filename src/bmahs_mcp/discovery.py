@@ -80,13 +80,46 @@ class Device:
 
     @property
     def state(self) -> str:
-        """设备公告的受管状态（§4.6）：registered=空闲可占用，managed=已被占用，offline=已下线。"""
+        """设备公告的原始状态值：1.0 为 registered/managed/offline，1.1 为 online/offline。
+
+        归一化判断请用 :attr:`online` / :attr:`busy`（两类协议互通）。
+        """
         src = self.hello or self.announce
         return str(src.get("state") or "unknown")
 
     @property
+    def protocol(self) -> str:
+        """设备公告的协议版本字符串（bmahs/1.0 或 bmahs/1.1），未知时为空。"""
+        src = self.hello or self.announce
+        proto = src.get("protocol")
+        return str(proto) if isinstance(proto, str) else ""
+
+    @property
+    def occupancy(self) -> str:
+        """占用策略（1.1 §4.6）：last-wins / exclusive。
+
+        读取顺序：hello.security（TCP 自述最权威）→ announce.security 摘要 →
+        announce 顶层 occupancy → 缺省 exclusive（兼容 1.0 设备）。
+        """
+        hello = self.hello or {}
+        return P.normalize_occupancy(
+            hello.get("security"), self.announce.get("security"), self.announce
+        )
+
+    @property
+    def online(self) -> bool:
+        """归一化在线状态（1.1 §9：registered/managed 当作 online）。"""
+        return P.is_online(self.state)
+
+    @property
+    def busy(self) -> bool:
+        """归一化忙碌状态：1.0 state=managed；1.1 公告 busy（exclusive 占用或有活动流）。"""
+        src = self.hello or self.announce
+        return P.busy_of(src.get("state"), src.get("busy"))
+
+    @property
     def holder(self) -> str | None:
-        """当前占用方标识（agent 名）；为 None 表示无人占用。"""
+        """当前占用方（exclusive）或最后控制者（last-wins）的 agent 名；无人时为 None。"""
         return (self.hello or self.announce).get("holder")
 
     @property

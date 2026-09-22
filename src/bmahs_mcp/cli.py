@@ -76,7 +76,7 @@ async def cmd_discover(args: argparse.Namespace) -> int:
     for d in sorted(devs, key=lambda x: x.id):
         print(
             f"  {d.id}  [{d.announce.get('type')}/{d.announce.get('service') or d.announce.get('svc')}]"
-            f"  {d.name}  state={d.state}"
+            f"  {d.name}  state={d.state}  occupancy={d.occupancy}"
             + (f"  holder={d.holder}" if d.holder else "")
         )
         print(f"      control: {d.uri}  summary: {d.announce.get('summary') or '-'}")
@@ -95,8 +95,9 @@ async def cmd_discover(args: argparse.Namespace) -> int:
 async def cmd_ctl(args: argparse.Namespace) -> int:
     """ctl 子命令：一次性地对设备执行单个动作。
 
-    按协议自动处理占用流程：控制类动作先 occupy（成功即持 token）→ 执行动作
-    → 默认 release；只读动作免 token 直发。
+    按设备占用策略（1.1 §4.6）自动选择流程：last-wins 设备免 occupy 直发动作；
+    exclusive 设备控制类动作先 occupy（成功即持 token）→ 执行动作 → 默认 release；
+    只读动作免 token 直发。
     """
     from . import client
     from . import protocol as P
@@ -131,6 +132,12 @@ async def cmd_ctl(args: argparse.Namespace) -> int:
     token = None
     released = False
     try:
+        if dev.occupancy == P.OCCUPANCY_LAST_WINS:
+            # 1.1 last-wins（§4.6.2）：免 occupy、不带 token，直发动作；
+            # occupy/release 也直发（设备可实现为空操作或回 unknown-action）
+            resp = await call({"action": action, "agent": agent, **extra})
+            print(json.dumps(resp, ensure_ascii=False, indent=2))
+            return 0 if resp.get("ok") else 1
         if action == "release":
             # release 需要原占用 token：CLI 不持久化，须显式通过 --arg token=... 提供
             if not extra.get("token"):

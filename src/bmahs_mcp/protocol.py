@@ -13,7 +13,8 @@ import re
 import time
 
 PROTO = "bmahs/1.0"
-PROTO_PREFIX = "bmahs"  # 智能体必须接受 bmahs*（现行候选 bmahs/1.0）
+PROTO_11 = "bmahs/1.1"  # 1.1 草案：占用策略、去掉必选 register、状态 online/offline
+PROTO_PREFIX = "bmahs"  # 智能体必须接受 bmahs*（bmahs/1.0 与 bmahs/1.1 互通）
 # UDP 组播报文的三种类型（§3）：announce=设备上线/状态变化广播，
 # query=智能体主动扫描（设备以 announce 应答），goodbye=设备下线告别。
 KINDS = ("announce", "query", "goodbye")
@@ -35,8 +36,16 @@ HB_MIN = 5.0
 
 # 全品类必须在 operations 中声明并实现的动作（§4.5）
 GENERIC_ACTIONS = frozenset({"describe", "info", "register", "occupy", "release", "who"})
+# 1.1 全设备必选的最小通用动作集（occupy/release 仅 exclusive 必选，register 非必选）
+GENERIC_ACTIONS_MIN = frozenset({"describe", "info", "who"})
 # 只读 / 登记刷新动作：不改变受管关系，不需要 token（§4.6 规则 2）
 READONLY_ACTIONS = frozenset({"describe", "info", "who", "register"})
+
+# 占用策略（1.1 §4.6）：last-wins=最后控制生效、无 token；exclusive=独占 + token。
+# 缺省按 exclusive 理解（兼容未公告 occupancy 的 1.0 设备）
+OCCUPANCY_LAST_WINS = "last-wins"
+OCCUPANCY_EXCLUSIVE = "exclusive"
+DEFAULT_OCCUPANCY = OCCUPANCY_EXCLUSIVE
 
 # 默认占用租约（§4.6）：未带 ttl 的 occupy 用 60 秒；9999 = 无限期
 DEFAULT_LEASE_SEC = 60
@@ -104,11 +113,12 @@ def build_query(agent_id: str, want: str = "*") -> bytes:
     """构造智能体的扫描报文（§3.1）：设备收到后按 want 过滤并以 announce 应答。
 
     ``want`` 为品类过滤串（如 ``light,display``），``*`` 表示不过滤。
+    protocol 写网关支持的最高版本（1.0/1.1 设备侧校验均为 ``bmahs`` 前缀，互通）。
     """
     return _dump(
         {
             "version": 1,
-            "protocol": PROTO,
+            "protocol": PROTO_11,
             "kind": "query",
             "timestamp": now(),
             "id": agent_id,
@@ -191,3 +201,32 @@ def hb_of(msg: dict) -> float:
 def expire_sec_for(hb: float) -> float:
     """无心跳删除时限（§4.6/§4.8-7）：clamp(12 × hb, 60 秒, 30 分钟)。"""
     return max(60.0, min(12.0 * max(float(hb), DEFAULT_HB), 1800.0))
+
+
+def normalize_occupancy(*sources) -> str:  # noqa: ANN002
+    """归一化占用策略（1.1 §4.5/§4.6）：按权威度顺序读取各 dict 的 ``occupancy``。
+
+    典型调用：``normalize_occupancy(hello.security, announce.security, announce)``
+    ——hello 的 security 自述最权威，announce 摘要次之（1.1 还允许 announce 顶层
+    携带 occupancy）。全部缺失或非法时缺省 ``exclusive``（兼容未公告的 1.0 设备）。
+    """
+    for src in sources:
+        if isinstance(src, dict):
+            occ = src.get("occupancy")
+            if occ in (OCCUPANCY_LAST_WINS, OCCUPANCY_EXCLUSIVE):
+                return occ
+    return DEFAULT_OCCUPANCY
+
+
+def is_online(state: str | None) -> bool:
+    """状态归一化（1.1 §4.6.1 / §9）：1.1 ``online`` 与 1.0 ``registered``/``managed``
+    都视为在线；``offline`` 及未知值视为不在线。"""
+    return state in ("online", "registered", "managed")
+
+
+def busy_of(state: str | None, busy) -> bool:
+    """占用/忙碌归一化：1.0 设备 ``busy`` 等价 ``state=managed``；1.1 设备以公告
+    ``busy`` 为准（exclusive 被占用或存在活动流），公告缺失时回退 1.0 规则。"""
+    if isinstance(busy, bool):
+        return busy
+    return state == "managed"

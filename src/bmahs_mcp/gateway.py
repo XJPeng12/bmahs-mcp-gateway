@@ -1,13 +1,15 @@
 """BMAHS ↔ MCP 网关核心。
 
-实现协议 §4.8「智能体义务」中与运行时相关的部分：
+实现协议 §4.8「智能体与协议客户端义务」中与运行时相关的部分：
 
 1. 持续发现设备，缓存每台设备的 ``hello``（自述 / operations / security）；
 2. 把每台设备的 ``operations`` 动态映射为 MCP 工具（``<设备id>__<动作>``），
    工具说明全部来自设备的自然语言字段；
-3. 代管占用 ``token``：网关以进程唯一 ``agent`` 身份 ``occupy``（自动占用为有限
-   租约），后续控制自动携带 token，token 不回显给模型、不写入任何日志；
-4. 服务退出时统一 ``release``，不把设备长期留在 ``managed``；
+3. 按 1.1 ``security.occupancy`` 逐台选择控制序列：``last-wins`` 设备直接发
+   业务动作（不 occupy、不带 token，§4.8-4）；``exclusive`` 设备代管占用
+   ``token``（自动占用为有限租约，后续控制自动携带，token 不回显给模型、
+   不写入任何日志）；occupancy 缺省按 exclusive，1.0 设备零回归；
+4. 服务退出时统一 ``release``（仅 exclusive 会话持有 token），不把设备留在占用态；
 5. ``security`` 当作硬约束（越界动作由设备拒绝，网关原样转达）。
 """
 
@@ -438,7 +440,16 @@ class Gateway:
 
         ttl 缺省用自动占用租约，超上限截断（见下方行内注释）；
         已持有 token 时带上它以刷新租约，token 失效则去掉重占一次。
+        last-wins 设备无需占用（1.1 §4.6.2）：不发网络包，直接返回提示信封，
+        避免对未实现 occupy 空操作的设备收到 unknown-action。
         """
+        if dev.occupancy == P.OCCUPANCY_LAST_WINS:
+            return {
+                "ok": True,
+                "action": "occupy",
+                "occupancy": P.OCCUPANCY_LAST_WINS,
+                "note": "该设备为 last-wins（最后控制生效）：无需占用，直接调用业务动作即可，最后一条命令自动生效。",
+            }
         agent = self.agent_for(skey)
         payload: dict = {"action": "occupy", "agent": agent}
         # 网关租约策略：不允许无限期占用。不带 ttl 用默认有限租约（120s），
@@ -464,7 +475,17 @@ class Gateway:
         return resp
 
     async def _release(self, dev: Device, skey: str = "local") -> dict:
-        """释放本会话对设备的占用；未持有 token 直接返回提示信封，token 已失效视同已释放。"""
+        """释放本会话对设备的占用；未持有 token 直接返回提示信封，token 已失效视同已释放。
+
+        last-wins 设备无占用关系可释放（1.1 §4.6.2）：不发网络包，返回提示信封。
+        """
+        if dev.occupancy == P.OCCUPANCY_LAST_WINS:
+            return {
+                "ok": True,
+                "action": "release",
+                "occupancy": P.OCCUPANCY_LAST_WINS,
+                "note": "该设备为 last-wins：没有占用关系，无需释放；后续控制会自然覆盖先前控制。",
+            }
         token = self._pop_token(skey, dev.id)
         if not token:
             return {
@@ -481,7 +502,7 @@ class Gateway:
             return {
                 "ok": True,
                 "action": "release",
-                "state": "registered",
+                "state": "online",
                 "event": "release",
                 "note": "原 token 已失效（设备重启或租约变化），视同已释放",
             }
@@ -490,11 +511,21 @@ class Gateway:
     async def _send_control(
         self, dev: Device, action: str, extra: dict | None = None, skey: str = "local"
     ) -> dict:
-        """发送一条动作请求；按需自动占用并携带 token，token 失效自动重占用一次。"""
+        """发送一条动作请求；按设备占用策略（1.1 §4.6）选择控制序列。
+
+        - ``last-wins``：直接发业务动作 + ``agent``，不 occupy、不带 token，
+          也不做 unauthorized 重试（§4.8-4：对 last-wins 不得再自动 occupy）；
+        - ``exclusive``：按需自动占用并携带 token，token 失效自动重占用一次。
+        """
         extra = dict(extra or {})
         if action in P.READONLY_ACTIONS:
             _, resp = await self._raw_call(
                 dev, {"action": action, "agent": self.agent_for(skey), **extra}
+            )
+            return resp
+        if dev.occupancy == P.OCCUPANCY_LAST_WINS:
+            _, resp = await self._raw_call(
+                dev, {"action": action, **extra, "agent": self.agent_for(skey)}
             )
             return resp
         token = self._token(skey, dev.id)
@@ -569,6 +600,8 @@ class Gateway:
                 name="bmahs_occupy",
                 description=(
                     "独占占用一台 BMAHS 设备（返回的 token 由网关保存并自动携带）。"
+                    "仅对 occupancy=exclusive 的设备有意义；last-wins 设备无需占用，"
+                    "调用时网关会直接返回提示而不发网络请求。"
                     "租约由网关强制为有限时长：不带 ttl 默认 120 秒（2 分钟），请求值超过"
                     "上限（默认 3600 秒）会被截断，不支持无限期占用。租约到期设备自动收回"
                     "占用权；任务结束也可调用 bmahs_release 提前释放。"
@@ -594,8 +627,9 @@ class Gateway:
             types.Tool(
                 name="bmahs_release",
                 description=(
-                    "释放对某台 BMAHS 设备的占用。任务结束、失败或取消后必须调用，"
-                    "否则其它智能体会一直收到「被占用」。"
+                    "释放对某台 BMAHS 设备的占用（仅 occupancy=exclusive 的设备需要）。"
+                    "任务结束、失败或取消后必须调用，否则其它智能体会一直收到「被占用」；"
+                    "last-wins 设备无需释放。"
                 ),
                 inputSchema={
                     "type": "object",
@@ -772,7 +806,11 @@ class Gateway:
                     "summary": hello.get("summary") or dev.announce.get("summary") or "",
                     "type": self._dev_type(dev),
                     "service": hello.get("service") or hello.get("svc") or dev.announce.get("service") or "",
+                    "protocol": dev.protocol or None,
+                    "occupancy": dev.occupancy,
                     "state": dev.state,
+                    "online": dev.online,
+                    "busy": dev.busy,
                     "holder": dev.holder,
                     "until": dev.until or None,
                     "occupied_by_gateway": any(
@@ -792,8 +830,9 @@ class Gateway:
             "count": len(items),
             "devices": items,
             "note": (
-                "控制类动作前网关会自动 occupy（默认 120 秒有限租约，可用 BMAHS_AUTO_OCCUPY_TTL 调整）"
-                "并携带 token；任务结束请 bmahs_release。"
+                "occupancy=exclusive 的设备：控制类动作前网关会自动 occupy（默认 120 秒有限租约，"
+                "可用 BMAHS_AUTO_OCCUPY_TTL 调整）并携带 token，任务结束请 bmahs_release；"
+                "occupancy=last-wins 的设备：无需 occupy/release，直接调用业务动作，最后一条命令生效。"
                 "ops_ready=false 的设备稍后自动就绪，或调用 bmahs_refresh。"
             ),
         }
