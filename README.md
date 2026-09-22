@@ -14,12 +14,21 @@ BMAHS（比马斯）设备协议 ↔ MCP 网关：把局域网内按 `bmahs/1.0`
 
 ## 安装
 
+推荐隔离安装（uv tool 或 pipx）：包与依赖装在独立环境，不污染系统/conda Python，任何终端可直接用 `bmahs-mcp`：
+
+```bash
+uv tool install "bmahs-mcp-gateway[http]"   # 首选；只用 stdio 模式可去掉 [http]
+pipx install "bmahs-mcp-gateway[http]"     # 等效的 pipx 写法
+```
+
+也可直接 pip 装（装进当前 Python 环境，依赖与其它包共享、可能冲突，换环境后命令不可用）：
+
 ```bash
 pip install bmahs-mcp-gateway            # stdio 模式，最小依赖
 pip install "bmahs-mcp-gateway[http]"    # 需要 Streamable HTTP 共享模式时
 ```
 
-或使用 [uv](https://docs.astral.sh/uv/)：`uv add bmahs-mcp-gateway`；命令行场景推荐隔离安装（不污染系统 Python）：`uv tool install "bmahs-mcp-gateway[http]"`（pipx 同理）。要求 Python ≥ 3.10。
+作为库集成时用 [uv](https://docs.astral.sh/uv/)：`uv add bmahs-mcp-gateway`。要求 Python ≥ 3.10。
 
 验证：`bmahs-mcp --version` 输出 `bmahs-mcp 0.1.1`。
 
@@ -81,7 +90,7 @@ HTTP 模式的端点为 `http://<host>:9530/mcp`；设置了 `--token` 后客户
 
 ## 协议
 
-BMAHS 协议要点：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连接后先读设备 hello；网关在协议中承担「智能体」角色。完整协议文档见 [docs/BMAHS.md](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/docs/BMAHS.md)。
+BMAHS 协议要点：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连接后先读设备 hello；网关在协议中承担「智能体」角色。完整协议文档见 [docs/BMAHS1.0.md](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/docs/BMAHS1.0.md)。
 
 ## 本地开发与构建
 

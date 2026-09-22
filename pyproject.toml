@@ -4,7 +4,7 @@ description = "BMAHS（比马斯）设备协议 ↔ MCP 网关：发现并操作
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "彭星杰" }]
+authors = [{ name = "pengxingjie" }]
 keywords = ["bmahs", "mcp", "iot", "smart-home", "zeroconf", "llm", "agent"]
 classifiers = [
     "Development Status :: 4 - Beta",
