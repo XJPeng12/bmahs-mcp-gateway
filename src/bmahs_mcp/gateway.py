@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ from pathlib import Path
 from mcp import types
 from mcp.shared.exceptions import MCPError
 
-from . import client, protocol as P, schemas
+from . import client, protocol as P, sanitize, schemas
 from .discovery import Device, Discovery
 
 log = logging.getLogger("bmahs.gateway")
@@ -47,9 +48,24 @@ HELLO_RETRY_SEC = 30.0
 # JSON-RPC「参数无效」错误码：调用不存在的工具时返回
 INVALID_PARAMS = 32602
 
+# BMAHS_DEVICE_TOOLS=1 时为每台设备生成的零参数 describe 别名所用到的动作定义
+# （通用动作不在各设备 operations 里重复出现，动态别名需要一份描述来源）
+_DESCRIBE_OP: dict = {
+    "name": "describe",
+    "description": "读取该设备的完整操作清单（operations）、安全边界（security）与自然语言自述。",
+}
+
 
 class GatewayError(Exception):
-    """网关本地错误（设备不可达、参数问题等）。"""
+    """网关本地错误（设备不可达、参数问题等）。
+
+    ``envelope`` 可选携带富错误信封（echo/retry_with/candidates，见
+    :mod:`sanitize`），server 层优先用它代替纯文本 ``{"code": "gateway"}``。
+    """
+
+    def __init__(self, message: str, *, envelope: dict | None = None) -> None:
+        super().__init__(message)
+        self.envelope = envelope
 
 
 class DeviceEnvelope(Exception):
@@ -133,6 +149,39 @@ class Gateway:
         # 只作用于动态工具，固定工具始终可用
         self.tool_allow = self._patterns("BMAHS_TOOL_ALLOW")
         self.tool_deny = self._patterns("BMAHS_TOOL_DENY")
+        # —— 工具调用参数死循环防护（docs/工具调用参数死循环_网关侧防护方案.md）——
+        # 防线②：参数净化器（dict 解包 / 字符串数字转类型 / 近似匹配），BMAHS_ARG_COERCE=0 关闭
+        self.arg_coerce = os.environ.get("BMAHS_ARG_COERCE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        # 防线③：同参重复失败升级提示；BMAHS_LOOP_GUARD_MAX=第 N 次下达停止令（下限 2）
+        self.loop_guard = os.environ.get("BMAHS_LOOP_GUARD", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        try:
+            guard_max = int(os.environ.get("BMAHS_LOOP_GUARD_MAX", "3") or 3)
+        except ValueError:
+            guard_max = 3
+        self.loop_guard_max = max(2, guard_max)
+        # 防线①：bmahs_describe 的 device 可选（唯一设备自动选中；多设备返回选择清单）
+        self.describe_optional = os.environ.get("BMAHS_DESCRIBE_OPTIONAL", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        # 备用方案：为每台设备生成零参数 <id>__describe 动态别名（工具表膨胀，默认关）
+        self.device_describe_tools = os.environ.get("BMAHS_DEVICE_TOOLS", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # 防线③状态：skey -> 最近一次失败 (指纹, 连续次数, 时刻)；任何成功调用即清除。
+        # 只记「最近一次」：威胁不是历史累计失败，而是连续原样重放，换调用即重置。
+        self._fail_streak: dict[str, tuple[str, int, float]] = {}
         # 占用 token 按会话隔离（P1）：stdio 单会话用 "local"；HTTP 模式每个 MCP
         # 会话一个键（s1/s2…），占用方显示为 <agent_id>-sN，可追溯到对话会话。
         # 注意 SDK 2.x 的 ctx.session 是"每请求重建的代理"，稳定的会话身份是
@@ -364,6 +413,19 @@ class Gateway:
                 mapping[name] = (dev.id, action)
                 desc_hash = hash(schemas.tool_description(hello, op)) & 0xFFFFFF
                 sig_parts.append(f"{name}:{desc_hash}")
+            if self.device_describe_tools:
+                # 备用方案（BMAHS_DEVICE_TOOLS=1）：零参数 <id>__describe 别名，
+                # 把「查详情必须手填 device」这个参数从工具面上消灭
+                name = schemas.mcp_tool_name(dev.id, "describe")
+                base, n = name, 2
+                while name in mapping and mapping[name] != (dev.id, "describe"):
+                    suffix = f"-{n}"
+                    name = base[: 64 - len(suffix)] + suffix
+                    n += 1
+                if not self._tool_hidden(name, dev.id, "describe"):
+                    mapping[name] = (dev.id, "describe")
+                    desc_hash = hash(schemas.tool_description(hello, dict(_DESCRIBE_OP))) & 0xFFFFFF
+                    sig_parts.append(f"{name}:{desc_hash}")
         sig = "|".join(sorted(sig_parts))
         changed = sig != self._tools_sig
         self.tool_map = mapping
@@ -372,14 +434,11 @@ class Gateway:
 
     # ------------------------------------------------------------------ 设备解析与控制
 
-    def resolve_device(self, ref) -> Device:  # noqa: ANN001
-        """把模型给的设备引用解析为 Device：先按 id 精确匹配 → 唯一同名 → 唯一子串模糊匹配。
-
-        三级都落空时抛 GatewayError 并附上当前已知设备清单，引导模型自查。
-        """
+    def resolve_quiet(self, ref) -> Device | None:  # noqa: ANN001
+        """:meth:`resolve_device` 的不抛错版：id 精确 → 唯一同名 → 唯一子串；落空返回 None。"""
         ref = str(ref or "").strip()
         if not ref:
-            raise GatewayError("未指定设备（请传设备 id 或显示名，可先用 bmahs_devices 查询）")
+            return None
         dev = self.discovery.get(ref)
         if dev is None:
             named = [d for d in self.discovery.all() if d.name == ref]
@@ -394,11 +453,32 @@ class Gateway:
             ]
             if len(fuzzy) == 1:
                 dev = fuzzy[0]
+        return dev
+
+    def resolve_device(self, ref) -> Device:  # noqa: ANN001
+        """把模型给的设备引用解析为 Device：先按 id 精确匹配 → 唯一同名 → 唯一子串模糊匹配。
+
+        三级都落空时抛带富错误信封的 GatewayError（echo 回显实际传参、retry_with
+        给示例 id、known_devices 列出当前已知设备），引导模型下一轮照抄正确形态。
+        """
+        ref = str(ref or "").strip()
+        if not ref:
+            raise GatewayError("未指定设备（请传设备 id 或显示名，可先用 bmahs_devices 查询）")
+        dev = self.resolve_quiet(ref)
         if dev is None:
             known = [
                 f"{d.id}（{d.name}）" for d in self.discovery.all()
-            ] or ["（局域网内暂无设备，可调用 bmahs_refresh 重新扫描）"]
-            raise GatewayError(f"找不到设备 {ref!r}。当前已知设备：{'；'.join(known)}")
+            ]
+            listing = "；".join(known) if known else "（局域网内暂无设备，可调用 bmahs_refresh 重新扫描）"
+            raise GatewayError(
+                f"找不到设备 {ref!r}。当前已知设备：{listing}",
+                envelope=sanitize.rich_error(
+                    f"找不到设备 {ref!r}。当前已知设备：{listing}",
+                    echo={"device": ref},
+                    retry_with={"device": sanitize.example_device_ref(self)} if known else None,
+                    candidates=sanitize.known_device_list(self) or None,
+                ),
+            )
         return dev
 
     @staticmethod
@@ -574,7 +654,17 @@ class Gateway:
     # ------------------------------------------------------------------ MCP: list_tools
 
     async def list_tools(self) -> list[types.Tool]:
-        """组装 MCP 工具表：7 个固定工具 + 每台设备的每个非通用动作一个动态工具。"""
+        """组装 MCP 工具表：7 个固定工具 + 每台设备的每个非通用动作一个动态工具。
+
+        防线①（docs/工具调用参数死循环_网关侧防护方案.md §4）：device 参数描述带
+        可照抄的字面量正例 + 负例（示例 id 取当前真实设备），从源头压低首错率。
+        """
+        example = sanitize.example_device_ref(self)
+        device_desc = (
+            "设备 id 或显示名。必须直接填字符串本身，如 "
+            f"{json.dumps(example, ensure_ascii=False)}；"
+            f"禁止传对象、禁止传 {{{json.dumps(example, ensure_ascii=False)}: \"设备名\"}} 这类 {{id: 名称}} 映射。"
+        )
         tools: list[types.Tool] = [
             types.Tool(
                 name="bmahs_devices",
@@ -605,13 +695,15 @@ class Gateway:
             ),
             types.Tool(
                 name="bmahs_describe",
-                description="读取某台 BMAHS 设备的完整操作清单（operations）、安全边界（security）与自然语言自述。",
+                description=(
+                    "读取某台 BMAHS 设备的完整操作清单（operations）、安全边界（security）与自然语言自述。"
+                    f"device 直接填 id 字符串（如 {json.dumps(example, ensure_ascii=False)}）；"
+                    "局域网内只有一台已知设备时可省略 device。"
+                ),
                 inputSchema={
                     "type": "object",
-                    "properties": {
-                        "device": {"type": "string", "description": "设备 id 或显示名"}
-                    },
-                    "required": ["device"],
+                    "properties": {"device": {"type": "string", "description": device_desc}},
+                    **({} if self.describe_optional else {"required": ["device"]}),
                     "additionalProperties": False,
                 },
                 annotations=types.ToolAnnotations(readOnlyHint=True),
@@ -631,7 +723,7 @@ class Gateway:
                     "properties": {
                         "device": {
                             "type": "string",
-                            "description": "设备 id 或显示名",
+                            "description": device_desc,
                         },
                         "ttl": {
                             "type": "integer",
@@ -654,7 +746,7 @@ class Gateway:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "device": {"type": "string", "description": "设备 id 或显示名"}
+                        "device": {"type": "string", "description": device_desc}
                     },
                     "required": ["device"],
                     "additionalProperties": False,
@@ -671,7 +763,7 @@ class Gateway:
                     "properties": {
                         "device": {
                             "type": "string",
-                            "description": "设备 id 或显示名",
+                            "description": device_desc,
                         },
                         "action": {
                             "type": "string",
@@ -679,7 +771,11 @@ class Gateway:
                         },
                         "args": {
                             "type": "object",
-                            "description": "动作参数（按该设备 operations 中该动作 args 的字段名与类型）",
+                            "description": (
+                                "动作参数对象，键=参数名，值类型按该设备 operations 中该动作 args 的声明。"
+                                "示例：亮度动作传 {\"brightness\": 50}（整数），"
+                                "不要传 {\"brightness\": \"50\"}，不要传数组。"
+                            ),
                         },
                     },
                     "required": ["device", "action"],
@@ -697,7 +793,7 @@ class Gateway:
                     "properties": {
                         "device": {
                             "type": "string",
-                            "description": "设备 id 或显示名",
+                            "description": device_desc,
                         },
                         "max_width": {
                             "type": "integer",
@@ -715,6 +811,8 @@ class Gateway:
             if dev is None or not dev.hello:
                 continue
             op = schemas.find_op(dev.hello, action)
+            if op is None and action == "describe":
+                op = dict(_DESCRIBE_OP)  # BMAHS_DEVICE_TOOLS 别名：通用动作不在设备 ops 里
             if op is None:
                 continue
             tools.append(
@@ -739,51 +837,225 @@ class Gateway:
     # ------------------------------------------------------------------ MCP: call_tool
 
     async def call_tool(self, name: str, arguments: dict | None, skey: str = "local") -> list:
-        """MCP 工具调用总入口：先路由固定工具，再按 tool_map 路由到具体设备动作。
+        """MCP 工具调用总入口：参数净化（防线②）→ 分发执行 → 错误统一过防循环守卫（防线③）。
 
         动态动作执行前校验 any_of（至少提供一个参数）约束；所有响应经 _mask
-        遮蔽 token、经 _require_ok 校验后以文本内容返回。
+        遮蔽 token、经 _require_ok 校验后以文本内容返回；任何成功调用都会重置
+        该会话的「连续同参失败」计数。
         """
         arguments = dict(arguments or {})
+        try:
+            result = await self._dispatch_tool(name, arguments, skey)
+        except DeviceEnvelope as e:
+            e.envelope = self._guarded_error(skey, name, arguments, e.envelope)
+            raise
+        except GatewayError as e:
+            env = e.envelope or {"ok": False, "code": "gateway", "error": str(e), "retryable": False}
+            e.envelope = self._guarded_error(skey, name, arguments, env)
+            raise
+        self._fail_streak.pop(skey, None)
+        return result
+
+    def _prep_device(self, arguments: dict) -> tuple[object, list[dict], dict | None]:
+        """防线②：净化 ``device`` 参数（BMAHS_ARG_COERCE=0 时原样透传）。"""
+        value = arguments.get("device")
+        if not self.arg_coerce:
+            return value, [], None
+        return sanitize.coerce_device_ref(self, value)
+
+    @staticmethod
+    def _attach_coerced(resp, notes: list[dict]):  # noqa: ANN001
+        """成功响应附 coerced 透明标注（防线②原则 2：让模型知道被矫正了什么）。"""
+        if notes and isinstance(resp, dict):
+            resp = dict(resp)
+            resp["coerced"] = notes
+        return resp
+
+    def _guarded_error(self, skey: str, name: str, arguments: dict, envelope: dict) -> dict:
+        """防线③：同一会话以完全相同参数连续失败时升级纠错提示。
+
+        指纹 = 工具名 + 规范化参数（换任何其他调用即重置）。第 2 次起在错误前加
+        「第 N 次相同失败」警示并附 retry_with 模板；第 loop_guard_max 次下达
+        停止令。提示逐级改写——字节级相同的错误响应本身就会成为强化燃料。
+        """
+        if not self.loop_guard:
+            return envelope
+        canon = name + "\x00" + json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+        fingerprint = hashlib.sha1(canon.encode("utf-8")).hexdigest()
+        prev = self._fail_streak.get(skey)
+        count = prev[1] + 1 if prev and prev[0] == fingerprint else 1
+        self._fail_streak[skey] = (fingerprint, count, time.monotonic())
+        if count < 2:
+            return envelope
+        out = dict(envelope)
+        out["repeat_count"] = count
+        base = f"⚠️ 这是第 {count} 次以完全相同的参数调用「{name}」失败。"
+        if count >= self.loop_guard_max:
+            out["error"] = (
+                base + "原样重试不会成功：请立即停止重试此调用，改用其他工具或修正参数"
+                "（参见 retry_with / candidates），或向用户说明情况并请求人工介入。"
+            )
+            out["directive"] = "stop"
+        else:
+            out["error"] = base + str(out.get("error", ""))
+            out["hint"] = "请直接复制 retry_with 中的参数重试，或改用其他工具/参数；不要原样重放。"
+        log.warning("会话 %s 工具 %s 以相同参数连续失败 %d 次", skey, name, count)
+        return out
+
+    async def _tool_describe(self, arguments: dict, skey: str) -> list:
+        """bmahs_describe：device 可选（防线①P1-4）+ 引用净化（防线②）。
+
+        未传 device 时：唯一已知设备自动选中；多台返回信息性选择清单（不报错，
+        不产生错误先例）；零台返回刷新提示。
+        """
+        notes: list[dict] = []
+        ref = arguments.get("device")
+        blank = ref is None or (isinstance(ref, str) and not ref.strip())
+        if blank and self.describe_optional:
+            devs = sorted(self.discovery.all(), key=lambda d: d.id)
+            if not devs:
+                return self._text(
+                    {
+                        "ok": True,
+                        "count": 0,
+                        "devices": [],
+                        "note": "局域网内暂无已知设备：可调用 bmahs_refresh 重新扫描后再试。",
+                    }
+                )
+            if len(devs) > 1:
+                example = devs[0].id
+                return self._text(
+                    {
+                        "ok": True,
+                        "count": len(devs),
+                        "devices": [
+                            {"id": d.id, "name": d.name, "type": self._dev_type(d)} for d in devs
+                        ],
+                        "note": "未指定 device 且当前有多台设备：请从上面选一台，"
+                        f'并按 {{"device": "<id>"}} 传 id 字符串'
+                        f'（如 {{"device": {json.dumps(example, ensure_ascii=False)}}}）重新调用。',
+                    }
+                )
+            dev = devs[0]
+            notes.append(
+                {
+                    "arg": "device",
+                    "from": None,
+                    "to": dev.id,
+                    "note": f"未指定 device，已自动选择唯一已知设备 {dev.id}",
+                }
+            )
+        else:
+            ref2, notes, err = self._prep_device(arguments)
+            if err:
+                raise DeviceEnvelope(err)
+            dev = self.resolve_device(ref2)
+        await self._ensure_hello(dev)
+        _, resp = await self._raw_call(
+            dev, {"action": "describe", "agent": self.agent_for(skey)}
+        )
+        return self._text(self._attach_coerced(self._require_ok(resp), notes))
+
+    async def _dispatch_tool(self, name: str, arguments: dict, skey: str) -> list:
+        """路由分发：先固定工具，再按 tool_map 路由到具体设备动作。"""
         if name == "bmahs_devices":
             return self._text(await self.tool_devices(arguments.get("type")))
         if name == "bmahs_refresh":
             return self._text(await self.tool_refresh())
         if name == "bmahs_describe":
-            dev = self.resolve_device(arguments.get("device"))
-            await self._ensure_hello(dev)
-            _, resp = await self._raw_call(
-                dev, {"action": "describe", "agent": self.agent_for(skey)}
-            )
-            return self._text(self._require_ok(resp))
+            return await self._tool_describe(arguments, skey)
         if name == "bmahs_occupy":
-            dev = self.resolve_device(arguments.get("device"))
-            return self._text(
-                self._require_ok(
-                    self._mask(await self._occupy(dev, arguments.get("ttl"), skey))
+            ref, notes, err = self._prep_device(arguments)
+            if err:
+                raise DeviceEnvelope(err)
+            dev = self.resolve_device(ref)
+            ttl, tnotes, terr = None, [], None
+            if self.arg_coerce:
+                ttl, tnotes, terr = sanitize.coerce_int(
+                    arguments.get("ttl"), arg="ttl", example=self.auto_occupy_ttl
                 )
-            )
+                if terr:
+                    raise DeviceEnvelope(terr)
+            resp = self._require_ok(self._mask(await self._occupy(dev, ttl, skey)))
+            return self._text(self._attach_coerced(resp, notes + tnotes))
         if name == "bmahs_release":
-            dev = self.resolve_device(arguments.get("device"))
-            return self._text(
-                self._require_ok(self._mask(await self._release(dev, skey)))
-            )
+            ref, notes, err = self._prep_device(arguments)
+            if err:
+                raise DeviceEnvelope(err)
+            dev = self.resolve_device(ref)
+            resp = self._require_ok(self._mask(await self._release(dev, skey)))
+            return self._text(self._attach_coerced(resp, notes))
         if name == "bmahs_call":
-            dev = self.resolve_device(arguments.get("device"))
+            ref, notes, err = self._prep_device(arguments)
+            if err:
+                raise DeviceEnvelope(err)
+            dev = self.resolve_device(ref)
             action = str(arguments.get("action") or "").strip()
             if not action:
                 raise GatewayError("缺少 action 参数")
+            hello = await self._ensure_hello(dev)
+            op = schemas.find_op(hello, action)
+            if op is None and self.arg_coerce:
+                # 动作名近似：只读动作自动改写；控制动作只建议、不代执行（防线②原则 3）
+                hit, names = sanitize.near_match_action(hello, action)
+                if hit is not None and hit in P.READONLY_ACTIONS:
+                    notes.append(
+                        {
+                            "arg": "action",
+                            "from": action,
+                            "to": hit,
+                            "note": f"动作名 {json.dumps(action, ensure_ascii=False)} 不存在，"
+                            f"已近似矫正为只读动作 {json.dumps(hit, ensure_ascii=False)}",
+                        }
+                    )
+                    action, op = hit, schemas.find_op(hello, hit)
+                elif hit is not None:
+                    raise DeviceEnvelope(
+                        sanitize.rich_error(
+                            f"设备 {dev.id} 的操作清单中没有动作 {json.dumps(action, ensure_ascii=False)}。"
+                            f"最接近的是 {json.dumps(hit, ensure_ascii=False)}（控制类动作，"
+                            "为安全起见网关不代为改写，请确认后显式调用）。",
+                            echo={"device": dev.id, "action": action},
+                            retry_with={"device": dev.id, "action": hit},
+                        )
+                    )
+                else:
+                    raise DeviceEnvelope(
+                        sanitize.rich_error(
+                            f"设备 {dev.id} 的操作清单中没有动作 {json.dumps(action, ensure_ascii=False)}。",
+                            echo={"device": dev.id, "action": action},
+                            candidates=names or None,
+                            retry_with={"device": dev.id, "action": names[0] if names else action},
+                        )
+                    )
             args = arguments.get("args")
-            if args is not None and not isinstance(args, dict):
+            if args is not None and not isinstance(args, dict) and not self.arg_coerce:
                 raise GatewayError("args 必须是对象（键为该动作的参数名）")
-            return self._text(
-                self._require_ok(
-                    self._mask(await self._send_control(dev, action, args, skey))
-                )
+            if self.arg_coerce:
+                args, anotes, aerr = sanitize.coerce_args_object(args, op)
+                if aerr:
+                    raise DeviceEnvelope(aerr)
+                if args and op is not None:
+                    args, tnotes = sanitize.coerce_op_arguments(op, args)
+                    anotes = anotes + tnotes
+            else:
+                anotes = []
+            resp = self._require_ok(
+                self._mask(await self._send_control(dev, action, args, skey))
             )
+            return self._text(self._attach_coerced(resp, notes + anotes))
         if name == "bmahs_screenshot":
-            dev = self.resolve_device(arguments.get("device"))
-            return await self.tool_screenshot(dev, arguments.get("max_width"), skey)
+            ref, notes, err = self._prep_device(arguments)
+            if err:
+                raise DeviceEnvelope(err)
+            dev = self.resolve_device(ref)
+            max_width = arguments.get("max_width")
+            if self.arg_coerce and max_width is not None:
+                max_width, mnotes, merr = sanitize.coerce_int(max_width, arg="max_width", example=640)
+                if merr:
+                    raise DeviceEnvelope(merr)
+                notes = notes + mnotes
+            return await self.tool_screenshot(dev, max_width, skey, coerced=notes)
         entry = self.tool_map.get(name)
         if entry is None:
             raise MCPError(
@@ -796,6 +1068,9 @@ class Gateway:
             raise GatewayError(f"设备 {dev_id} 已下线，请调用 bmahs_refresh 刷新列表")
         hello = await self._ensure_hello(dev)
         op = schemas.find_op(hello, action)
+        if op is None and action == "describe":
+            # BMAHS_DEVICE_TOOLS 零参数别名：复用 describe 的可选参数实现
+            return await self._tool_describe({}, skey)
         if op is None:
             raise GatewayError(f"设备 {dev_id} 的操作清单中已没有 {action}（设备能力可能已更新）")
         any_of = op.get("any_of") or []
@@ -811,11 +1086,14 @@ class Gateway:
                     "retryable": False,
                 }
             )
-        return self._text(
-            self._require_ok(
-                self._mask(await self._send_control(dev, action, arguments, skey))
-            )
+        if self.arg_coerce:
+            arguments, dnotes = sanitize.coerce_op_arguments(op, arguments)
+        else:
+            dnotes = []
+        resp = self._require_ok(
+            self._mask(await self._send_control(dev, action, arguments, skey))
         )
+        return self._text(self._attach_coerced(resp, dnotes))
 
     # ------------------------------------------------------------------ 静态工具实现
 
@@ -868,6 +1146,10 @@ class Gateway:
                 "ops_ready=false 的设备稍后自动就绪，或调用 bmahs_refresh。"
                 "id_conflict=true 的设备：局域网内观测到多个控制地址自称同一 id（可能是两台设备撞 id，"
                 "也可能是同一设备多网卡），控制结果可能不确定，建议先人工核实。"
+                "填参提醒：需要 device 参数的工具，device 直接填上面 devices[].id 的字符串本身，"
+                f"例如 {{\"device\": {json.dumps(sanitize.example_device_ref(self), ensure_ascii=False)}}}；"
+                "不要传对象或 {\"id\": \"名称\"} 映射。查单台设备状态优先用它的动态工具"
+                " <id>__<动作>（各设备的 tool_names 已列出），bmahs_describe 用于读取完整操作清单。"
             ),
         }
 
@@ -912,11 +1194,14 @@ class Gateway:
 
     # ------------------------------------------------------------------ 截图（ui 剖面 §4.9）
 
-    async def tool_screenshot(self, dev: Device, max_width=None, skey: str = "local") -> list:
+    async def tool_screenshot(
+        self, dev: Device, max_width=None, skey: str = "local", coerced: list[dict] | None = None
+    ) -> list:  # noqa: ANN001
         """bmahs_screenshot：抓一帧设备画面（ui.start → 读一帧二进制流 → ui.stop）。
 
         返回 [文本元数据, JPEG 图片内容] 两个内容块，帧同时落盘到 capture_dir；
-        设备未声明 ui 能力、未占用或流失败时抛 GatewayError / DeviceEnvelope。
+        设备未声明 ui 能力、未占用或流失败时抛 GatewayError / DeviceEnvelope；
+        ``coerced`` 为调用前参数净化的透明标注（防线②）。
         """
         hello = await self._ensure_hello(dev)
         op = schemas.find_op(hello, "ui.start")
@@ -972,23 +1257,22 @@ class Gateway:
         ext = "jpg" if codec == 1 else "h264"
         path = self.capture_dir / f"{dev.id}_{int(time.time())}.{ext}"
         path.write_bytes(frame)
+        meta: dict = {
+            "ok": True,
+            "action": "screenshot",
+            "device": dev.id,
+            "width": width,
+            "height": height,
+            "codec": "jpeg" if codec == 1 else f"codec-{codec}",
+            "saved_to": str(path),
+            "bytes": len(frame),
+        }
+        if coerced:
+            meta["coerced"] = coerced
         blocks: list = [
             types.TextContent(
                 type="text",
-                text=json.dumps(
-                    {
-                        "ok": True,
-                        "action": "screenshot",
-                        "device": dev.id,
-                        "width": width,
-                        "height": height,
-                        "codec": "jpeg" if codec == 1 else f"codec-{codec}",
-                        "saved_to": str(path),
-                        "bytes": len(frame),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                text=json.dumps(meta, ensure_ascii=False, indent=2),
             )
         ]
         if codec == 1:

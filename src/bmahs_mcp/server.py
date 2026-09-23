@@ -46,6 +46,10 @@ def build_server(gw: Gateway, *, per_session: bool = False) -> Server:
             "（occupancy）自动选择控制方式：exclusive 设备控制前自动 occupy 并携带 token，"
             "任务结束（含失败/取消）必须 bmahs_release；last-wins 设备无需占用/释放，"
             "直接调用业务动作即可（最后一条命令生效）。"
+            "填参守则：所有工具的 device 参数直接填设备 id 字符串本身（如 \"lamp-01\"），"
+            "不要传对象或 {id: 名称} 映射；数值参数按 schema 类型传（整数不要加引号）。"
+            "同一调用失败时不要原样重试：按错误信息里的 retry_with/hint 修正参数，"
+            "连续失败请改用其他工具或向用户求助。"
         ),
         on_list_tools=_make_list_tools(gw, _skey),
         on_call_tool=_make_call_tool(gw, _skey),
@@ -90,15 +94,14 @@ def _make_call_tool(gw: Gateway, _skey):
                 is_error=True,
             )
         except GatewayError as e:
+            # 网关错误：优先用富错误信封（echo/retry_with/candidates，参数净化与
+            # 防循环守卫附加字段都在里面），没有信封时退回纯文本格式
+            payload = e.envelope or {"ok": False, "code": "gateway", "error": str(e)}
             return types.CallToolResult(
                 content=[
                     types.TextContent(
                         type="text",
-                        text=json.dumps(
-                            {"ok": False, "code": "gateway", "error": str(e)},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
+                        text=json.dumps(payload, ensure_ascii=False, indent=2),
                     )
                 ],
                 is_error=True,
