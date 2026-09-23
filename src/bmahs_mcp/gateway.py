@@ -114,12 +114,18 @@ class Gateway:
         self.capture_dir = Path(
             os.environ.get("BMAHS_CAPTURE_DIR") or Path(tempfile.gettempdir()) / "bmahs_captures"
         )
+        # id 冲突处置策略（docs/设备id冲突-现状与改进.md §5.1）：warn=标记+告警+
+        # 工具描述警示（默认，兼容多网卡设备的持续误报源）；isolate=冲突设备不
+        # 生成动态工具且拒绝控制类调用；off=完全不检测（多网卡误报时的逃生门）
+        policy = os.environ.get("BMAHS_ID_CONFLICT_POLICY", "warn").strip().lower()
+        self.id_conflict_policy = policy if policy in ("warn", "isolate", "off") else "warn"
         self.discovery = Discovery(
             self.agent_id,
             query_interval=query_interval,
             expire_sec=expire_sec,
             static_uris=static_uris,
             bonjour=bonjour_browse,
+            conflict_detect=self.id_conflict_policy != "off",
             on_change=self._on_devices_changed,
         )
         # 工具暴露过滤（P1）：BMAHS_TOOL_ALLOW / BMAHS_TOOL_DENY，逗号分隔的通配符
@@ -339,6 +345,8 @@ class Gateway:
             hello = dev.hello
             if not hello:
                 continue
+            if self.id_conflict_policy == "isolate" and dev.id_conflict:
+                continue  # isolate：疑似 id 冲突的设备不暴露动态工具，防控制串台
             for op in hello.get("operations") or hello.get("ops") or []:
                 if not isinstance(op, dict):
                     continue
@@ -435,6 +443,16 @@ class Gateway:
                 await self._notify_tools_changed()
         return hello, resp
 
+    def _guard_conflict(self, dev: Device) -> None:
+        """isolate 策略下拒绝与疑似 id 冲突设备的控制交互；只读动作放行，便于诊断。"""
+        if self.id_conflict_policy == "isolate" and dev.id_conflict:
+            raise GatewayError(
+                f"设备 {dev.id} 疑似 id 冲突（局域网内多个控制地址自称 {dev.id}，"
+                f"观测到 {('、'.join(sorted(dev.controls_seen))) or '多个地址'}），"
+                "已按 BMAHS_ID_CONFLICT_POLICY=isolate 隔离控制类动作；"
+                "请人工核实并修改重复的设备 id 后重试"
+            )
+
     async def _occupy(self, dev: Device, ttl=None, skey: str = "local") -> dict:
         """占用一台设备并把签发的 token 存入本会话；返回设备响应信封。
 
@@ -450,6 +468,7 @@ class Gateway:
                 "occupancy": P.OCCUPANCY_LAST_WINS,
                 "note": "该设备为 last-wins（最后控制生效）：无需占用，直接调用业务动作即可，最后一条命令自动生效。",
             }
+        self._guard_conflict(dev)
         agent = self.agent_for(skey)
         payload: dict = {"action": "occupy", "agent": agent}
         # 网关租约策略：不允许无限期占用。不带 ttl 用默认有限租约（120s），
@@ -523,6 +542,7 @@ class Gateway:
                 dev, {"action": action, "agent": self.agent_for(skey), **extra}
             )
             return resp
+        self._guard_conflict(dev)
         if dev.occupancy == P.OCCUPANCY_LAST_WINS:
             _, resp = await self._raw_call(
                 dev, {"action": action, **extra, "agent": self.agent_for(skey)}
@@ -700,11 +720,21 @@ class Gateway:
             tools.append(
                 types.Tool(
                     name=name,
-                    description=schemas.tool_description(dev.hello, op),
+                    description=self._tool_description_guarded(dev, op),
                     inputSchema=schemas.input_schema(op),
                 )
             )
         return tools
+
+    def _tool_description_guarded(self, dev, op: dict) -> str:  # noqa: ANN001
+        """组装动态工具描述；warn 策略下为疑似 id 冲突的设备追加警示行。"""
+        desc = schemas.tool_description(dev.hello, op)
+        if dev.id_conflict and self.id_conflict_policy == "warn":
+            desc += (
+                "\n⚠️ 该设备 id 在局域网内观测到多个控制地址（疑似 id 冲突），"
+                "控制结果可能并非总是命中同一台实体设备，建议人工核实后再依赖。"
+            )
+        return desc
 
     # ------------------------------------------------------------------ MCP: call_tool
 
@@ -817,6 +847,8 @@ class Gateway:
                         dev.id in toks for toks in self.tokens.values()
                     ),
                     "control": dev.uri,
+                    "id_conflict": dev.id_conflict,
+                    "conflict_controls": sorted(dev.controls_seen) if dev.id_conflict else [],
                     "model": hello.get("model") or dev.announce.get("model") or "",
                     "last_seen_age_sec": max(0, now_s - dev.last_seen) if dev.last_seen else None,
                     "source": dev.source,
@@ -832,8 +864,10 @@ class Gateway:
             "note": (
                 "occupancy=exclusive 的设备：控制类动作前网关会自动 occupy（默认 120 秒有限租约，"
                 "可用 BMAHS_AUTO_OCCUPY_TTL 调整）并携带 token，任务结束请 bmahs_release；"
-                "occupancy=last-wins 的设备：无需 occupy/release，直接调用业务动作，最后一条命令生效。"
+                "occupancy=last-wins 的设备：无需占用/释放，直接调用业务动作，最后一条命令生效。"
                 "ops_ready=false 的设备稍后自动就绪，或调用 bmahs_refresh。"
+                "id_conflict=true 的设备：局域网内观测到多个控制地址自称同一 id（可能是两台设备撞 id，"
+                "也可能是同一设备多网卡），控制结果可能不确定，建议先人工核实。"
             ),
         }
 

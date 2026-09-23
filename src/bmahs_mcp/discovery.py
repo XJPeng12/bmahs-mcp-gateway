@@ -28,6 +28,10 @@ from .bonjour import BonjourBrowser, txt_to_announce
 
 log = logging.getLogger("bmahs.discovery")
 
+# id 冲突判定的活跃窗口（秒）：稳态 announce 间隔 5s 是协议硬性下限（§15），
+# 60s = 12 个心跳；正常换 IP（§3.3）的旧地址会在一个窗口后自动衰减出判定
+ID_CONFLICT_WINDOW = 60.0
+
 
 @dataclass
 class Device:
@@ -55,6 +59,11 @@ class Device:
     # Bonjour 浏览登记的 tcp://host:port（_bmahs._tcp 的 SRV 地址）；其余设备为
     # None。该通道设备的生命周期由 mDNS 记录增删驱动，不参与心跳过期
     bonjour_uri: str | None = None
+    # 同 id 多地址观测（id 冲突检测，docs/设备id冲突-现状与改进.md §4）：
+    # control -> (最近一次该 control 的广播时刻 Unix 秒, model)；检测关闭时不记录
+    controls_seen: dict[str, tuple[float, str]] = field(default_factory=dict)
+    # 活跃窗口内观测到 ≥2 个不同 control：疑似两台设备撞 id，或同一设备的多网卡多地址
+    id_conflict: bool = False
 
     @property
     def id(self) -> str:
@@ -134,6 +143,19 @@ class Device:
             return "static"
         return "bonjour" if self.bonjour_uri else "multicast"
 
+    def eval_id_conflict(self, window: float) -> bool:
+        """活跃窗口（秒）内是否观测到 ≥2 个不同 control：同 id 冲突信号。
+
+        窗口外的地址条目顺带清理。正常换 IP（§3.3）的旧地址一个窗口后自动
+        衰减、冲突解除；同一设备的多网卡多地址会持续命中（误报源，见
+        docs/设备id冲突-现状与改进.md §4），处置策略交由网关层配置。
+        """
+        now = P.now()
+        self.controls_seen = {
+            c: v for c, v in self.controls_seen.items() if now - v[0] <= window
+        }
+        return len(self.controls_seen) >= 2
+
 
 class _Rx(asyncio.DatagramProtocol):
     """UDP 数据报回调适配器：把 asyncio 传输层收到的报文转交 Discovery 处理。"""
@@ -162,6 +184,7 @@ class Discovery:
         expire_sec: float = 1800.0,
         static_uris: list[str] | None = None,
         bonjour: bool = True,
+        conflict_detect: bool = True,
         on_change=None,  # Callable[[], Awaitable[None]] | None
     ) -> None:
         self.agent_id = agent_id
@@ -171,6 +194,8 @@ class Discovery:
         self.static_uris = static_uris or []
         # 是否启用 Bonjour 浏览通道（协议 §3.2；zeroconf 缺失时自动降级）
         self.bonjour = bonjour
+        # 是否检测同 id 多控制地址（id 冲突）；关闭时不记录 controls_seen
+        self.conflict_detect = conflict_detect
         self._browser: BonjourBrowser | None = None
         # 设备列表变化（新增/下线/状态变化）时的异步回调，网关用它触发工具表重建
         self.on_change = on_change
@@ -407,7 +432,32 @@ class Discovery:
         )
         dev.announce = msg
         dev.last_seen = P.now()
-        return bool(new or changed)
+        return self._track_conflict(dev) or bool(new or changed)
+
+    def _track_conflict(self, dev: Device) -> bool:
+        """记录本条 announce 的 control 指纹并评估 id 冲突；标记翻转时打日志。
+
+        返回 True 表示冲突标记发生变化（调用方应触发 on_change 重建工具表）。
+        """
+        if not self.conflict_detect:
+            return False
+        control = str(dev.announce.get("control") or "")
+        if control:
+            dev.controls_seen[control] = (P.now(), str(dev.announce.get("model") or ""))
+        was = dev.id_conflict
+        dev.id_conflict = dev.eval_id_conflict(ID_CONFLICT_WINDOW)
+        if dev.id_conflict and not was:
+            log.warning(
+                "设备 id 冲突告警：%s 在 %d 秒窗口内观测到多个控制地址（%s）——"
+                "可能是两台设备撞 id（控制会串台），也可能是同一设备的多网卡多地址；"
+                "处置策略见 BMAHS_ID_CONFLICT_POLICY",
+                dev.id,
+                int(ID_CONFLICT_WINDOW),
+                "、".join(sorted(dev.controls_seen)),
+            )
+        elif was and not dev.id_conflict:
+            log.info("设备 %s 的 id 冲突已解除（活跃窗口内仅剩单一控制地址）", dev.id)
+        return dev.id_conflict != was
 
     def _remove(self, dev_id: str) -> bool:
         """把设备移出注册表（goodbye 下线）；静态设备不删（登记值仍在，重连即恢复）。"""
